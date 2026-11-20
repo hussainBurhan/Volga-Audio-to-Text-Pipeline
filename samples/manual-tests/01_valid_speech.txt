@@ -1,0 +1,1 @@
+This is a short test recording for the audio transcription pipeline. We need to finalize the deployment by Friday. Please send the meeting notes to the team after lunch.
