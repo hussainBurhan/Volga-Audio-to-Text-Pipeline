@@ -324,6 +324,28 @@ Loads the real `base` model and sends `samples/manual-tests/01_valid_speech.wav`
 six-minute file (as a background job) through the full HTTP pipeline. Takes about three minutes. Assertions are loose (language, key words, timestamp sanity) because
 exact wording can vary between model versions.
 
+### Sample files for manual testing
+
+[samples/manual-tests](samples/manual-tests) has one file per case. Send them with
+`curl -F "file=@samples/manual-tests/<name>" http://localhost:8000/api/v1/transcriptions`
+(or `/api/v1/transcription-jobs` where noted).
+
+| File | Expected |
+|---|---|
+| `01_valid_speech.wav` | `200`, 29 words, `en` (reference text in `01_valid_speech.txt`) |
+| `02_valid_speech.mp3`, `03_valid_speech.m4a` | `200`, same transcript |
+| `04_silence_no_speech.wav` | `200`, empty transcript, `language: null` |
+| `05_empty_zero_bytes.wav` | `400 EMPTY_FILE` |
+| `06_corrupt_not_audio.wav` | `400 INVALID_AUDIO` |
+| `07_unsupported_extension.txt` | `415 UNSUPPORTED_AUDIO_FORMAT` |
+| `08_flac_disguised_as.wav` | `415 UNSUPPORTED_AUDIO_FORMAT` |
+| `09_too_large_25mib.wav` | `413 FILE_TOO_LARGE` |
+| `10_long_6min_for_job.mp3` | `422 AUDIO_TOO_LONG` synchronously; `202` then `completed` as a job |
+| `11_too_long_62min_for_job.mp3` | `422 AUDIO_TOO_LONG` even as a job (over one hour) |
+
+The speech files are synthetic (macOS `say`); the rest are generated with FFmpeg or are
+deliberately invalid.
+
 ### What was actually measured
 
 Environment: laptop with an Intel Core i7-9750H (12 logical cores), macOS 14.6.1, Python 3.12.5,
