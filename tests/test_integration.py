@@ -5,6 +5,8 @@ through the full HTTP pipeline. Assertions are deliberately loose: exact wording
 between model versions and decoding settings.
 """
 
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -56,3 +58,39 @@ def test_silence_returns_an_empty_completed_result(client, tmp_path):
     body = response.json()
     assert (body["transcript"], body["segments"], body["word_count"]) == ("", [], 0)
     assert body["language"] is None
+
+
+def test_long_audio_is_transcribed_as_a_background_job(client, tmp_path):
+    # ~6 minutes: the sample looped 36 times. Too long for the synchronous endpoint.
+    long_audio = tmp_path / "long.mp3"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-stream_loop", "35", "-i", str(SAMPLE), str(long_audio)],
+        check=True, stdin=subprocess.DEVNULL,
+    )
+    files = {"file": ("long.mp3", long_audio.read_bytes(), "audio/mpeg")}
+
+    too_long = client.post("/api/v1/transcriptions", files=files)
+    assert too_long.status_code == 422
+    assert too_long.json()["error"]["code"] == "AUDIO_TOO_LONG"
+
+    accepted = client.post("/api/v1/transcription-jobs", files=files)
+    assert accepted.status_code == 202, accepted.text
+    url = accepted.headers["Location"]
+
+    deadline = time.monotonic() + 600
+    while (job := client.get(url).json())["status"] in ("queued", "processing"):
+        assert time.monotonic() < deadline, "job timed out"
+        assert client.get("/health").status_code == 200  # server stays responsive
+        time.sleep(1)
+
+    assert job["status"] == "completed", job
+    result = job["result"]
+    assert result["duration_seconds"] > 300
+    # Timestamps are global across the model's 30-second windows, and stay in order.
+    starts = [s["start"] for s in result["segments"]]
+    assert starts == sorted(starts)
+    assert result["segments"][-1]["end"] > 300
+    assert result["word_count"] > 800  # 36 repetitions of a 29-word passage
+    print(f"\nlong audio: {result['duration_seconds']}s audio, "
+          f"{result['processing_time_seconds']}s processing, "
+          f"{len(result['segments'])} segments, {result['word_count']} words")
