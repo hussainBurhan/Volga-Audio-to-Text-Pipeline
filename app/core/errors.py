@@ -45,6 +45,12 @@ class InvalidAudio(AppError):
     message = "The file could not be decoded as audio."
 
 
+class JobNotFound(AppError):
+    status_code = 404
+    code = "JOB_NOT_FOUND"
+    message = "No transcription job with this ID. Jobs are kept in memory and expire."
+
+
 class FileTooLarge(AppError):
     status_code = 413
     code = "FILE_TOO_LARGE"

@@ -54,24 +54,28 @@ class RequestContextMiddleware:
 
 
 class BodySizeLimitMiddleware:
-    """Rejects request bodies larger than ``max_body_bytes`` with 413.
+    """Rejects request bodies larger than the limit for their path with 413.
 
     ``Content-Length`` gives a cheap early rejection, but it is client-supplied and absent
     for chunked uploads, so the bytes actually received are counted as well. This runs
     before the multipart parser spools anything to disk.
     """
 
-    def __init__(self, app: ASGIApp, max_body_bytes: int) -> None:
+    def __init__(
+        self, app: ASGIApp, max_body_bytes: int, path_limits: dict[str, int] | None = None
+    ) -> None:
         self.app = app
         self.max_body_bytes = max_body_bytes
+        self.path_limits = path_limits or {}  # exact path -> its own limit
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        limit = self.path_limits.get(scope["path"], self.max_body_bytes)
         declared = Headers(scope=scope).get("content-length", "")
-        if declared.isdigit() and int(declared) > self.max_body_bytes:
+        if declared.isdigit() and int(declared) > limit:
             request_id = scope.get("state", {}).get("request_id", "")
             response = error_response(
                 request_id, FileTooLarge.status_code, FileTooLarge.code, FileTooLarge.message
@@ -86,7 +90,7 @@ class BodySizeLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.max_body_bytes:
+                if received > limit:
                     # Raised inside the route's body parsing; FastAPI re-raises
                     # HTTPExceptions untouched, and our handler renders the 413.
                     raise HTTPException(

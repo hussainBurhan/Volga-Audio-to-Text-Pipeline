@@ -1,4 +1,8 @@
-"""The transcription pipeline: validate -> stage -> inspect -> transcribe -> post-process."""
+"""The transcription pipeline: validate -> stage -> inspect -> transcribe -> post-process.
+
+Two entry points share it: a synchronous one for short clips, and background jobs for
+long audio, where holding an HTTP connection open for the whole inference is not sensible.
+"""
 
 import asyncio
 import logging
@@ -26,6 +30,7 @@ from app.services.audio import (
     save_upload,
     validated_extension,
 )
+from app.services.jobs import Job, JobStore
 from app.services.postprocess import assemble_transcript, build_segments, count_words
 
 logger = logging.getLogger(__name__)
@@ -54,7 +59,10 @@ class TranscriptionService:
         self._provider = provider
         self._inspector = inspector
         # Inference is CPU/GPU-bound; this caps how many run at once in this process.
+        # Synchronous requests and background jobs compete for the same slots.
         self._slots = asyncio.Semaphore(settings.max_concurrent_transcriptions)
+        self._jobs = JobStore(settings.max_active_jobs, settings.job_ttl_seconds)
+        self._tasks: set[asyncio.Task[None]] = set()  # keeps running jobs referenced
         if settings.temp_dir is not None:
             settings.temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -62,36 +70,139 @@ class TranscriptionService:
     def model_loaded(self) -> bool:
         return self._provider is not None
 
+    # --- synchronous: short clips ------------------------------------------------------
+
     async def transcribe_upload(
         self, upload: AsyncReadable, filename: str | None, language: str | None, request_id: str
     ) -> TranscriptionResponse:
         started = time.perf_counter()
-        provider = self._provider
-        if provider is None:
-            raise BackendUnavailable()
+        provider = self._require_provider()
+        path, info, language = await self._stage(
+            upload,
+            filename,
+            language,
+            max_bytes=self._settings.max_upload_bytes,
+            max_seconds=self._settings.max_audio_seconds,
+        )
+        try:
+            return await self._transcribe_staged(
+                provider, path, info, language, request_id, started,
+                queue_timeout=self._settings.queue_timeout_seconds,
+            )
+        finally:
+            path.unlink(missing_ok=True)
 
+    # --- asynchronous: long audio ------------------------------------------------------
+
+    async def submit_job(
+        self, upload: AsyncReadable, filename: str | None, language: str | None, request_id: str
+    ) -> Job:
+        """Validate and stage the upload now; transcribe in the background.
+
+        Bad input still fails fast with a normal 4xx. Only the slow part is deferred.
+        """
+        started = time.perf_counter()
+        provider = self._require_provider()
+        job = self._jobs.create(request_id)  # reserves capacity before accepting bytes
+        try:
+            path, info, language = await self._stage(
+                upload,
+                filename,
+                language,
+                max_bytes=self._settings.max_job_upload_bytes,
+                max_seconds=self._settings.max_job_audio_seconds,
+            )
+        except BaseException:
+            self._jobs.discard(job.id)
+            raise
+        task = asyncio.create_task(self._run_job(job, provider, path, info, language, started))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return job
+
+    def get_job(self, job_id: str) -> Job:
+        return self._jobs.get(job_id)
+
+    async def _run_job(
+        self,
+        job: Job,
+        provider: TranscriptionProvider,
+        path: Path,
+        info: AudioInfo,
+        language: str | None,
+        started: float,
+    ) -> None:
+        def mark_processing() -> None:
+            job.status = "processing"
+
+        try:
+            # No queue timeout: a job is allowed to wait its turn.
+            result = await self._transcribe_staged(
+                provider, path, info, language, job.id, started,
+                queue_timeout=None, on_start=mark_processing,
+            )
+            self._jobs.complete(job, result)
+        except AppError as exc:
+            self._jobs.fail(job, exc.code, exc.message)
+        except Exception:
+            logger.exception("transcription job failed job_id=%s", job.id)
+            self._jobs.fail(job, AppError.code, AppError.message)
+        except asyncio.CancelledError:  # shutdown
+            self._jobs.fail(job, AppError.code, "The server stopped before this job finished.")
+            raise
+        finally:
+            path.unlink(missing_ok=True)
+
+    # --- shared steps ------------------------------------------------------------------
+
+    def _require_provider(self) -> TranscriptionProvider:
+        if self._provider is None:
+            raise BackendUnavailable()
+        return self._provider
+
+    async def _stage(
+        self,
+        upload: AsyncReadable,
+        filename: str | None,
+        language: str | None,
+        *,
+        max_bytes: int,
+        max_seconds: float,
+    ) -> tuple[Path, AudioInfo, str | None]:
+        """Validate the request and leave a checked audio file on disk. Caller deletes it."""
         # Cheap checks first, before any bytes are written to disk.
         language = validate_language(language)
         suffix = validated_extension(filename)
-
         path = await save_upload(
-            upload,
-            suffix=suffix,
-            max_bytes=self._settings.max_upload_bytes,
-            directory=self._settings.temp_dir,
+            upload, suffix=suffix, max_bytes=max_bytes, directory=self._settings.temp_dir
         )
         try:
             info = await run_in_threadpool(
                 self._inspector,
                 path,
-                max_duration_seconds=self._settings.max_audio_seconds,
+                max_duration_seconds=max_seconds,
                 timeout_seconds=self._settings.ffmpeg_timeout_seconds,
             )
-            result = await self._run_inference(provider, path, language, request_id)
-        finally:
-            # Single cleanup point for every path: success, validation error, model failure.
+        except BaseException:
             path.unlink(missing_ok=True)
+            raise
+        return path, info, language
 
+    async def _transcribe_staged(
+        self,
+        provider: TranscriptionProvider,
+        path: Path,
+        info: AudioInfo,
+        language: str | None,
+        request_id: str,
+        started: float,
+        *,
+        queue_timeout: float | None,
+        on_start: Callable[[], None] | None = None,
+    ) -> TranscriptionResponse:
+        result = await self._run_inference(
+            provider, path, language, request_id, queue_timeout, on_start
+        )
         segments = build_segments(result.segments)
         transcript = assemble_transcript(segments)
         elapsed = time.perf_counter() - started
@@ -112,17 +223,23 @@ class TranscriptionService:
         )
 
     async def _run_inference(
-        self, provider: TranscriptionProvider, path: Path, language: str | None, request_id: str
+        self,
+        provider: TranscriptionProvider,
+        path: Path,
+        language: str | None,
+        request_id: str,
+        queue_timeout: float | None,
+        on_start: Callable[[], None] | None,
     ) -> ProviderResult:
-        # Backpressure: wait a bounded time for an inference slot, then shed load with 503
-        # instead of letting requests (and their temp files) pile up without limit.
+        # Backpressure: a synchronous request waits a bounded time for an inference slot,
+        # then is shed with 503 instead of piling up without limit.
         try:
-            await asyncio.wait_for(
-                self._slots.acquire(), timeout=self._settings.queue_timeout_seconds
-            )
+            await asyncio.wait_for(self._slots.acquire(), timeout=queue_timeout)
         except TimeoutError:
             raise ServerBusy(headers={"Retry-After": "5"}) from None
         try:
+            if on_start:
+                on_start()
             # Off the event loop, so /health and other requests stay responsive.
             return await run_in_threadpool(provider.transcribe, path, language)
         except AppError:

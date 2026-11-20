@@ -14,6 +14,12 @@ class Settings(BaseSettings):
     max_upload_bytes: int = Field(20 * 1024 * 1024, gt=0)
     max_audio_seconds: float = Field(300.0, gt=0)
 
+    # Long audio goes through asynchronous jobs, which get their own, larger limits.
+    max_job_upload_bytes: int = Field(200 * 1024 * 1024, gt=0)
+    max_job_audio_seconds: float = Field(3600.0, gt=0)
+    max_active_jobs: int = Field(4, ge=1)  # queued + processing; beyond this, 503
+    job_ttl_seconds: float = Field(3600.0, gt=0)  # how long a finished result is kept
+
     # Speech-to-text model
     stt_model_size: str = "base"
     stt_device: str = "cpu"
@@ -26,7 +32,7 @@ class Settings(BaseSettings):
     queue_timeout_seconds: float = Field(30.0, ge=0)
 
     # FFmpeg tooling
-    ffmpeg_timeout_seconds: float = Field(30.0, gt=0)
+    ffmpeg_timeout_seconds: float = Field(60.0, gt=0)
 
     # Where uploads are staged; None means the system temp directory.
     temp_dir: Path | None = None

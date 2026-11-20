@@ -2,12 +2,20 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
 
-from app.schemas.transcription import ErrorResponse, HealthResponse, TranscriptionResponse
+from app.schemas.transcription import (
+    ErrorResponse,
+    HealthResponse,
+    JobResponse,
+    TranscriptionResponse,
+)
+from app.services.jobs import Job
 from app.services.transcription import TranscriptionService
 
 router = APIRouter()
+
+JOBS_PATH = "/api/v1/transcription-jobs"
 
 
 def get_service(request: Request) -> TranscriptionService:
@@ -51,3 +59,41 @@ async def create_transcription(
     return await service.transcribe_upload(
         file, file.filename, language, request.state.request_id
     )
+
+
+def _job_response(job: Job) -> JobResponse:
+    return JobResponse(id=job.id, status=job.status, result=job.result, error=job.error)
+
+
+@router.post(
+    JOBS_PATH,
+    response_model=JobResponse,
+    status_code=202,
+    responses={k: v for k, v in _ERROR_RESPONSES.items() if k != 500},
+    tags=["transcription jobs"],
+)
+async def create_transcription_job(
+    request: Request,
+    response: Response,
+    service: ServiceDep,
+    file: Annotated[UploadFile, File(description="Audio file: .wav, .mp3 or .m4a.")],
+    language: Annotated[
+        str | None,
+        Form(description="Optional language hint such as `en`. Omit to auto-detect."),
+    ] = None,
+) -> JobResponse:
+    """For long audio: validate now, transcribe in the background, poll for the result."""
+    job = await service.submit_job(file, file.filename, language, request.state.request_id)
+    response.headers["Location"] = f"{JOBS_PATH}/{job.id}"
+    return _job_response(job)
+
+
+@router.get(
+    JOBS_PATH + "/{job_id}",
+    response_model=JobResponse,
+    responses={404: {"model": ErrorResponse, "description": "Unknown or expired job."}},
+    tags=["transcription jobs"],
+)
+async def get_transcription_job(job_id: str, service: ServiceDep) -> JobResponse:
+    """Job state. `result` has the same shape as the synchronous endpoint's response."""
+    return _job_response(service.get_job(job_id))

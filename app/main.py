@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from starlette.concurrency import run_in_threadpool
 
-from app.api.routes import router
+from app.api.routes import JOBS_PATH, router
 from app.core.config import Settings, get_settings
 from app.core.errors import register_exception_handlers
 from app.core.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
@@ -59,6 +59,7 @@ def create_app(
     app.add_middleware(
         BodySizeLimitMiddleware,
         max_body_bytes=settings.max_upload_bytes + _MULTIPART_OVERHEAD_BYTES,
+        path_limits={JOBS_PATH: settings.max_job_upload_bytes + _MULTIPART_OVERHEAD_BYTES},
     )
     app.add_middleware(RequestContextMiddleware)
     register_exception_handlers(app)

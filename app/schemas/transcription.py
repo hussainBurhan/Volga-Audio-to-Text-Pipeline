@@ -37,6 +37,17 @@ class ErrorResponse(BaseModel):
     error: ErrorDetail
 
 
+class JobResponse(BaseModel):
+    id: str = Field(description="Job ID. Poll GET /api/v1/transcription-jobs/{id}.")
+    status: Literal["queued", "processing", "completed", "failed"]
+    result: TranscriptionResponse | None = Field(
+        default=None, description="Present once status is `completed`."
+    )
+    error: ErrorDetail | None = Field(
+        default=None, description="Present once status is `failed`."
+    )
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     model_loaded: bool = Field(
