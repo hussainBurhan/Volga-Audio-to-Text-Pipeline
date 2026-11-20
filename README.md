@@ -17,8 +17,9 @@ Everything beyond that sentence is a design decision of mine, not a requirement 
 Partners: Python/FastAPI, faster-whisper, the REST contract, the supported formats, the
 20 MiB / 300 s limits, Docker, and the test strategy.
 
-**Deliberate scope:** one synchronous endpoint for short clips, stateless, no database,
-no authentication, no frontend. A working, tested vertical slice rather than a platform.
+**Deliberate scope:** a synchronous endpoint for short clips, a small in-process job queue
+for long audio, no database, no authentication, no frontend. A working, tested vertical slice
+rather than a platform.
 
 ## Quick start
 
@@ -114,6 +115,42 @@ Returns `200` with the JSON shown above. Field notes:
   still `200 completed` with `transcript: ""`, `segments: []`, `word_count: 0`, and
   `language: null` (a language "detected" from silence would be noise).
 
+### Long audio: `POST /api/v1/transcription-jobs`
+
+Audio longer than the synchronous limit (300 s) goes through a background job instead of
+holding the HTTP connection open. Same form fields; limits are 200 MiB and 1 hour by default.
+
+```bash
+curl -s -i -F "file=@long-recording.mp3" http://localhost:8000/api/v1/transcription-jobs
+```
+
+The file is validated straight away, so bad input still gets an immediate `4xx`. Valid input
+gets `202 Accepted`, a `Location` header, and:
+
+```json
+{"id": "5d0c…", "status": "queued", "result": null, "error": null}
+```
+
+Poll `GET /api/v1/transcription-jobs/{id}`. `status` moves `queued → processing →
+completed | failed`. When completed, `result` is exactly the synchronous response shape; when
+failed, `error` has the usual `code`/`message`.
+
+How long files are actually handled:
+
+- **Windowing is the model's job.** Whisper works on 30-second windows. faster-whisper slides
+  that window across the file, carries text context from one window to the next, and reports
+  timestamps relative to the whole file, so segments from a one-hour recording need no
+  stitching. I do not split the file myself: cutting at fixed offsets risks cutting words in
+  half, and the library already does this correctly.
+- **Memory is bounded by the duration limit.** The decoded audio is held in memory as 16 kHz
+  mono float32 — about 3.8 MB per minute, roughly 230 MB for the one-hour maximum.
+- **Jobs wait their turn.** They share the single inference slot with synchronous requests
+  and queue for it without a timeout. At most `APP_MAX_ACTIVE_JOBS` (default 4) may be queued
+  or running; further submissions get `503 SERVER_BUSY`.
+- **Job state is in memory.** Finished results are kept for `APP_JOB_TTL_SECONDS` (default one
+  hour) and then dropped. Jobs do not survive a restart and are not shared between processes,
+  so run a single worker process. This is the main thing a production version would change.
+
 ### `GET /health`
 
 `{"status": "ok", "model_loaded": true}`. This is a liveness check plus one honest fact:
@@ -133,13 +170,14 @@ Every error has one shape:
 | 400 | `MISSING_FILE` | No `file` part in the form |
 | 400 | `EMPTY_FILE` | Zero-byte upload |
 | 400 | `INVALID_AUDIO` | Not decodable as audio, or no audio stream |
-| 413 | `FILE_TOO_LARGE` | Larger than `APP_MAX_UPLOAD_BYTES` (default 20 MiB) |
+| 404 | `JOB_NOT_FOUND` | Unknown or expired job ID |
+| 413 | `FILE_TOO_LARGE` | Larger than `APP_MAX_UPLOAD_BYTES` (20 MiB), or `APP_MAX_JOB_UPLOAD_BYTES` (200 MiB) for jobs |
 | 415 | `UNSUPPORTED_AUDIO_FORMAT` | Extension or actual container is not WAV/MP3/M4A |
 | 422 | `INVALID_LANGUAGE` | Unknown language hint |
-| 422 | `AUDIO_TOO_LONG` | Longer than `APP_MAX_AUDIO_SECONDS` (default 300 s) |
+| 422 | `AUDIO_TOO_LONG` | Longer than `APP_MAX_AUDIO_SECONDS` (300 s), or `APP_MAX_JOB_AUDIO_SECONDS` (1 h) for jobs |
 | 500 | `TRANSCRIPTION_FAILED` / `INTERNAL_ERROR` | Model or server failure; details go to logs only |
 | 503 | `TRANSCRIPTION_UNAVAILABLE` | Model not loaded, or FFmpeg missing on the server |
-| 503 | `SERVER_BUSY` | No inference slot became free in time (`Retry-After` header set) |
+| 503 | `SERVER_BUSY` | No inference slot became free in time, or too many jobs queued (`Retry-After` set) |
 
 ## Architecture
 
@@ -163,6 +201,7 @@ client ── multipart upload ──▶ RequestContextMiddleware   request ID, 
 | [app/main.py](app/main.py) | App factory, model lifecycle, wiring |
 | [app/api/routes.py](app/api/routes.py) | HTTP only — no business logic |
 | [app/services/transcription.py](app/services/transcription.py) | Pipeline orchestration, concurrency limit, cleanup |
+| [app/services/jobs.py](app/services/jobs.py) | In-memory job store for long audio |
 | [app/services/audio.py](app/services/audio.py) | Bounded upload staging, FFmpeg validation |
 | [app/services/postprocess.py](app/services/postprocess.py) | Deterministic text/segment processing |
 | [app/providers/base.py](app/providers/base.py) | `TranscriptionProvider` protocol |
@@ -184,10 +223,16 @@ accuracy per unit of effort, but adds a secret, a cost, and a network dependency
 new class; tests inject a fake through `create_app(provider=...)`, so the fast suite never
 imports the ML stack. Cost: slightly more code than a single script.
 
-**Synchronous endpoint for short clips.** The simplest contract to run, test and review: one
-request, one response. It ties up an HTTP connection for the length of inference, which is why
-the duration limit exists. Long audio needs the asynchronous design under
-[Production evolution](#production-evolution).
+**Synchronous for short clips, background jobs for long ones.** One request, one response is
+the simplest contract to run, test and review, but it ties up an HTTP connection for the
+length of inference — measured at roughly half the audio's duration for a six-minute file on
+my laptop. So anything over 300 s goes through a job: `202` now, poll for the result. Both
+paths run the same staging, validation, inference and post-processing code; only the waiting
+differs. The job queue is an in-process `asyncio` task plus a dictionary, not Celery/Redis:
+enough to make long files work, small enough to read in a minute. Its cost is durability —
+jobs are lost on restart and tied to one process. *Alternative considered:* splitting long
+files with FFmpeg and transcribing chunks in parallel; rejected because fixed cuts split words
+and lose cross-window context, and one CPU gains little from parallel inference.
 
 **Model loaded once; inference off the event loop; explicit backpressure.** The model is
 created once per process at startup. Inference is blocking and CPU-heavy, so it runs in a
@@ -209,10 +254,11 @@ per request — about 125 ms measured for the 10 s sample (two FFmpeg process la
 hint, since it is client-supplied and absent on chunked uploads. The pipeline then counts the
 file's own bytes while copying it to the staging file.
 
-**Stateless temp-file pipeline.** The upload is written to a `mkstemp`-generated name (the
-client filename contributes only its allow-listed extension) and deleted in a single `finally`
-block that covers success, validation errors and model failures. Nothing is persisted, so
-there is no history and no retrieval by ID.
+**Temp files with one owner; nothing persisted.** The upload is written to a
+`mkstemp`-generated name (the client filename contributes only its allow-listed extension) and
+deleted in a `finally` block that covers success, validation errors and model failures — for a
+job, when the job ends. Nothing is written to a database. Synchronous results are not kept at
+all; job results live in memory until their TTL passes.
 
 **Deterministic post-processing only.** Whitespace normalization, ordering, assembly and
 counting are pure functions. The transcript is treated as evidence: the service never
@@ -228,8 +274,10 @@ with `APP_STT_VAD_FILTER=false`.
 - Generated temp filenames; subprocesses use argument lists (no shell) with timeouts.
 - Logs contain request ID, method, path, status and timings — never transcript text, original
   filenames, or audio bytes. Server-side tracebacks are logged; clients get a generic message.
-- No audio or transcript is retained by the application. Two unavoidable caches exist: the
-  model weights in the Hugging Face cache, and Starlette's own spooled copy of the upload,
+- No audio is retained after processing, and synchronous transcripts are never stored. Job
+  transcripts stay in process memory until `APP_JOB_TTL_SECONDS` passes; anyone who knows the
+  (random UUID) job ID can read one, since there is no authentication. Two other caches exist:
+  the model weights in the Hugging Face cache, and Starlette's own spooled copy of the upload,
   which it deletes when the request ends.
 - **Not implemented: authentication, authorization, rate limiting, TLS.** These are
   prerequisites before exposing this service publicly or sending it sensitive recordings.
@@ -242,7 +290,7 @@ with `APP_STT_VAD_FILTER=false`.
 pytest
 ```
 
-72 tests, about 4 seconds. They need `ffmpeg`/`ffprobe` (tiny sine-tone fixtures are
+86 tests, about 6 seconds. They need `ffmpeg`/`ffprobe` (tiny sine-tone fixtures are
 synthesized on the fly; those tests skip if FFmpeg is absent). Coverage by case:
 
 | # | Case | Where |
@@ -262,6 +310,9 @@ synthesized on the fly; those tests skip if FFmpeg is absent). Coverage by case:
 | 13 | `/health` | `test_health_reports_ok_and_model_state` |
 
 Every rejection test also asserts that the staging directory is empty afterwards.
+[tests/test_jobs.py](tests/test_jobs.py) covers the long-audio path: `202` before inference
+finishes, queueing for the single slot, per-path limits, immediate `4xx` for bad input,
+failed jobs, capacity refusal, and result expiry.
 
 ### Real-model smoke test
 
@@ -269,8 +320,8 @@ Every rejection test also asserts that the staging directory is empty afterwards
 pytest -m integration
 ```
 
-Loads the real `base` model and sends `samples/manual-tests/01_valid_speech.wav` and a generated silent file through
-the full HTTP pipeline. Assertions are loose (language, key words, timestamp sanity) because
+Loads the real `base` model and sends `samples/manual-tests/01_valid_speech.wav`, a generated silent file, and a
+six-minute file (as a background job) through the full HTTP pipeline. Takes about three minutes. Assertions are loose (language, key words, timestamp sanity) because
 exact wording can vary between model versions.
 
 ### What was actually measured
@@ -280,13 +331,15 @@ FFmpeg 9.0.1, faster-whisper 1.2.1, model `base`, CPU, `int8`, beam size 5, VAD 
 
 | Check | Result |
 |---|---|
-| Fast suite | 72 passed |
-| Integration suite | 2 passed (speech sample; silence → empty result) |
+| Fast suite | 86 passed |
+| Integration suite | 3 passed (speech sample; silence → empty result; six-minute job) |
 | `01_valid_speech.wav` via `curl` against a running server | 9.96 s audio → 1.70 s processing |
 | Same clip as MP3 (with `language=en`) | 1.09 s processing, identical transcript |
 | Same clip as M4A | 1.61 s processing, identical transcript |
 | Validation step alone (ffprobe + decode) on `01_valid_speech.wav` | about 125 ms |
 | Corrupt `.wav`, `.txt` upload, bad language, no file, 25 MiB file | 400 / 415 / 422 / 400 / 413, as documented |
+| Six-minute MP3 (the sample looped 36×) as a background job | 358.6 s audio → 165 s processing; 108 segments in order, last one past 300 s; 1,043 of 1,044 words |
+| Same file on the synchronous endpoint | `422 AUDIO_TOO_LONG` |
 | Staged uploads left in the temp directory afterwards | 0 |
 | Clean copy: `python3 -m venv`, `pip install -r requirements-dev.txt`, both suites | pass |
 | Docker image: build, run, transcribe `01_valid_speech.wav` | pass (2.09 s processing in the container) |
@@ -295,14 +348,20 @@ FFmpeg 9.0.1, faster-whisper 1.2.1, model `base`, CPU, `int8`, beam size 5, VAD 
 ([samples/manual-tests/01_valid_speech.txt](samples/manual-tests/01_valid_speech.txt)) word for word. That is one clip of clean synthetic
 speech (generated with the macOS `say` command), so it demonstrates that the integration works —
 it is **not** an accuracy measurement. No WER benchmark on natural, noisy, or non-English speech
-has been run, and I make no accuracy or language-coverage claim. Latency figures are three
-single requests on one laptop, not a benchmark.
+has been run, and I make no accuracy or language-coverage claim. Latency figures are single
+runs on one laptop, not a benchmark. The long file ran at about 2.2× real time against roughly
+6× for the short clip; I have not investigated why (the looped, highly repetitive content may
+trigger Whisper's re-decoding fallback), so treat it as a pessimistic data point. The Docker
+and clean-copy checks were run before the job endpoint was added and not repeated.
 
 ## Known limitations
 
-- One clip at a time per process; clips limited to 20 MiB / 300 s by default.
-- The client waits for the whole transcription; a dropped connection does not cancel inference.
-- No persistence, retrieval by ID, authentication, or rate limiting.
+- One transcription at a time per process. Limits: 20 MiB / 300 s synchronous, 200 MiB / 1 h as a job.
+- Jobs are in memory: lost on restart, not shared across processes, no cancellation, no
+  progress reporting, no webhooks. A long job blocks short requests behind it (they get `503`
+  after the queue timeout).
+- On the synchronous endpoint a dropped connection does not cancel inference.
+- No database, authentication, or rate limiting.
 - Segment-level timestamps only (no word-level timestamps, no speaker diarization).
 - The upload briefly exists on disk twice (the framework's spooled copy and the staging file).
 - `GET /health` does not prove the model can transcribe, only that it loaded.
@@ -313,8 +372,8 @@ single requests on one laptop, not a benchmark.
 
 ## Production evolution
 
-For long recordings or real concurrency, the synchronous endpoint becomes a job system. This
-is described, not built:
+The job endpoint already has the right API shape (`202`, poll by ID). What it lacks is
+durability and scale. The next version, described but not built:
 
 1. The client uploads directly to object storage with short-lived, authenticated credentials.
 2. The API records a job in a database and returns `202 Accepted` with a job ID.
@@ -325,6 +384,6 @@ is described, not built:
 6. Around that: retries with idempotent jobs, a dead-letter queue, retention and deletion
    policy, access control, quotas, metrics, and cost tracking.
 
-The pieces here that carry over unchanged are the provider protocol, the validation module,
-and the post-processing functions; the route handler and the in-process semaphore are what get
-replaced.
+The pieces here that carry over unchanged are the HTTP contract, the provider protocol, the
+validation module, and the post-processing functions. `JobStore` becomes a database table and
+the `asyncio` task becomes a queue consumer.
