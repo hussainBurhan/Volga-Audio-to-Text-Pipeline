@@ -1,0 +1,9 @@
+# Versions below are the ones this project was tested with (Python 3.12).
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+python-multipart==0.0.34
+pydantic-settings==2.16.3
+faster-whisper==1.2.1
+# faster-whisper 1.2.1 calls av.open(metadata_errors=...), which PyAV 19 removed.
+# Verified working with 16.1.0; 17 and 18 were not tested.
+av>=11,<17
