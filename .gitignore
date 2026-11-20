@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local configuration and secrets
+.env
+
+# Model weights / caches
+models/
+*.bin
+.cache/
+
+# Audio: only the test fixtures in samples/manual-tests are tracked
+*.wav
+*.mp3
+*.m4a
+*.aiff
+!samples/manual-tests/*
+
+.DS_Store
