@@ -5,7 +5,6 @@ __pycache__/
 .pytest_cache/
 
 # Local configuration and secrets
-.env
 
 # Model weights / caches
 models/
@@ -20,3 +19,5 @@ models/
 !samples/manual-tests/*
 
 .DS_Store
+config.bat
+node_modules

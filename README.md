@@ -21,6 +21,45 @@ Partners: Python/FastAPI, faster-whisper, the REST contract, the supported forma
 for long audio, no database, no authentication, no frontend. A working, tested vertical slice
 rather than a platform.
 
+## Approach
+
+I treated this as a small backend service rather than a script, because "for downstream use"
+implies another program will consume the output. The work went in this order:
+
+1. **Define the output first.** A typed JSON contract (transcript, timestamped segments,
+   language, duration) that a consumer can rely on, plus one error shape for every failure.
+2. **Get one real file through end to end** with an existing model, before adding anything else.
+3. **Make the input side defensive.** Uploads are untrusted, so size, format and decodability
+   are checked with FFmpeg before the model sees the file, and temp files are always removed.
+4. **Keep the model replaceable.** The pipeline talks to a small provider interface, which
+   also lets the tests run in seconds without loading a model.
+5. **Handle the two cases that break a naive version:** concurrent requests (one inference
+   slot, bounded waiting, clear `503`) and long audio (background jobs with polling).
+6. **Measure, then document.** Every number in this README was measured on my machine, and
+   the limitations are listed rather than hidden.
+
+The rest of this document covers how to run it, the API, the
+[code structure](#architecture), the [design decisions and trade-offs](#design-decisions),
+and the [known limitations](#known-limitations).
+
+### Assumptions
+
+The brief is open-ended, so these are the assumptions I worked to:
+
+- **Audio is mostly short recordings** (voice notes, meeting clips) in common formats. Up to
+  5 minutes is handled in the request; up to 1 hour as a background job.
+- **A single machine with a CPU** is the target. No GPU or cloud account is required to run or
+  review it, which is why the default model is the small `base` one.
+- **The consumer is another service**, so the output is structured JSON, not formatted text.
+- **Transcripts are evidence.** The service only normalizes whitespace; it never rewrites,
+  corrects, or summarizes what the model produced.
+- **Accuracy is the model's job.** I chose and configured an existing model; I did not tune
+  or benchmark accuracy beyond confirming the pipeline works.
+- **It runs in a trusted environment.** There is no authentication or rate limiting, so it
+  should not be exposed publicly as is.
+- **Load is light.** One transcription at a time per process; anything beyond that is refused
+  with a clear error rather than queued indefinitely.
+
 ## Quick start
 
 Prerequisites:
